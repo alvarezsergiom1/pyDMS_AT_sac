@@ -874,6 +874,10 @@ class NeuralNetworkSharpener(DecisionTreeSharpener):
         # install but this shouldn't prevent the use of other parts of pyDMS.
         if self.regressionType == REG_sknn_ann:
             import sknn.mlp as ann_sknn
+            try:
+                from sknn.platform import gpu64
+            except:
+                from sknn.platform import cpu64, threading
 
     def _doFit(self, goodData_LR, goodData_HR, weight, local):
         ''' Private function. Fits the neural network.
