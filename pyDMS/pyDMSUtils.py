@@ -40,7 +40,7 @@ def getRasterInfo(raster):
 
 
 def resampleWithGdalWarp(srcFile, templateFile, outFile="", outFormat="MEM",
-                         resampleAlg="average"):
+                         resampleAlg="average", multithread=True):
     # Get template projection, extent and resolution
     proj, gt, sizeX, sizeY, extent, _ = getRasterInfo(templateFile)
 
@@ -52,7 +52,9 @@ def resampleWithGdalWarp(srcFile, templateFile, outFile="", outFormat="MEM",
                       xRes=gt[1],
                       yRes=gt[5],
                       outputBounds=extent,
-                      resampleAlg=resampleAlg)
+                      resampleAlg=resampleAlg,
+                      multithread=multithread,
+                      warpOptions={"NUM_THREADS": "ALL_CPUS"})
 
     return outDs
 
@@ -140,7 +142,7 @@ def saveImg(data, geotransform, proj, outPath, noDataValue=None, fieldNames=[]):
             ds.close()
             ds = gdal.Open('NETCDF:"'+outPath+'":'+fieldNames[0])
 
-    print('Saved ' + outPath)
+        print('Saved ' + outPath)
 
     return ds
 
