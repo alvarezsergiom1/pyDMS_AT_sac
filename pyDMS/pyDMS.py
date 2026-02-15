@@ -127,6 +127,10 @@ class DecisionTreeRegressorWithLinearLeafRegression(tree.DecisionTreeRegressor):
                 extrapolationRange = self.linearRegressionExtrapolationRatio * (
                                         self.leafParameters[leafValue]["max"] -
                                         self.leafParameters[leafValue]["min"])
+                # print(f"leafValue: {leafValue}")
+                # print(f"min value: {self.leafParameters[leafValue]['min']}")
+                # print(f"max value: {self.leafParameters[leafValue]['max']}")
+                # print(f"extrapolationRange: {extrapolationRange}")
                 y[ind] = np.maximum(y[ind],
                                     self.leafParameters[leafValue]["min"] - extrapolationRange)
                 y[ind] = np.minimum(y[ind],
@@ -483,46 +487,111 @@ class DecisionTreeSharpener(object):
             output.
         '''
 
-        # Open and read the high resolution input file
+        # Open the high resolution input file
         highResFile = gdal.Open(highResFilename)
-        inData = np.zeros((highResFile.RasterYSize, highResFile.RasterXSize,
-                           highResFile.RasterCount))
-        for band in range(highResFile.RasterCount):
-            data = highResFile.GetRasterBand(band+1).ReadAsArray().astype(float)
-            no_data = highResFile.GetRasterBand(band+1).GetNoDataValue()
-            data[data == no_data] = np.nan
-            inData[:, :, band] = data
         gt = highResFile.GetGeoTransform()
 
-        shape = inData.shape
-        ysize = shape[0]
-        xsize = shape[1]
+        # Determine image size and band count
+        ysize = highResFile.RasterYSize
+        xsize = highResFile.RasterXSize
+        bands = highResFile.RasterCount
 
-        # Temporarly get rid of NaN's
-        nanInd = np.isnan(inData)
-        inData[nanInd] = 0
+        # Estimate memory required for full in-memory array (bytes)
+        estimated_bytes = np.int64(ysize) * np.int64(xsize) * np.int64(bands) * np.int64(4)  # float32
+        MEM_THRESHOLD = 8 * 1024**3  # 8 GiB - if larger, use tiled/streaming path
 
-        outWindowData = np.empty((ysize, xsize))*np.nan
-        outFullData = np.empty((ysize, xsize))*np.nan
-        # Do the downscailing on the moving windows if there are any and also process the full
-        # scene using the same windows to optimize memory usage
-        for i, extent in enumerate(self.windowExtents):
-            print(i)
-            if self.reg[i] is not None:
-                [minX, minY] = utils.point2pix(extent[0], gt)  # UL
-                [minX, minY] = [max(minX, 0), max(minY, 0)]
-                [maxX, maxY] = utils.point2pix(extent[1], gt)  # LR
-                [maxX, maxY] = [min(maxX, xsize), min(maxY, ysize)]
-                windowInData = inData[minY:maxY, minX:maxX, :]
-                outWindowData[minY:maxY, minX:maxX] = \
-                    self._doPredict(windowInData, self.reg[i])
-                if self.reg[-1] is not None:
-                    outFullData[minY:maxY, minX:maxX] = \
-                        self._doPredict(windowInData, self.reg[-1])
+        # Prepare output arrays (use float32 to halve memory compared to float64)
+        outWindowData = np.full((ysize, xsize), np.nan, dtype=np.float32)
+        outFullData = np.full((ysize, xsize), np.nan, dtype=np.float32)
 
-        # If there were no moving windows then do the downscailing on the whole input image
-        if np.all(np.isnan(outFullData)) and self.reg[-1] is not None:
-            outFullData = self._doPredict(inData, self.reg[-1])
+        # nan mask for final cleanup (2D boolean where any band was NaN)
+        nanInd = np.zeros((ysize, xsize), dtype=bool)
+
+        if estimated_bytes <= MEM_THRESHOLD:
+            # Small enough to load entire image into memory as float32
+            inData = np.zeros((ysize, xsize, bands), dtype=np.float32)
+            for band in range(bands):
+                data = highResFile.GetRasterBand(band+1).ReadAsArray().astype(np.float32)
+                no_data = highResFile.GetRasterBand(band+1).GetNoDataValue()
+                if no_data is not None:
+                    data[data == no_data] = np.nan
+                inData[:, :, band] = data
+            # Build 2D nan mask and zero out NaNs for prediction
+            nan3 = np.isnan(inData)
+            nanInd = np.any(nan3, axis=2)
+            inData[nan3] = 0.0
+
+            # Process windows (uses in-memory slices)
+            for i, extent in enumerate(self.windowExtents):
+                print(i)
+                if self.reg[i] is not None:
+                    [minX, minY] = utils.point2pix(extent[0], gt)  # UL
+                    [minX, minY] = [max(minX, 0), max(minY, 0)]
+                    [maxX, maxY] = utils.point2pix(extent[1], gt)  # LR
+                    [maxX, maxY] = [min(maxX, xsize), min(maxY, ysize)]
+                    windowInData = inData[minY:maxY, minX:maxX, :]
+                    outWindowData[minY:maxY, minX:maxX] = \
+                        self._doPredict(windowInData, self.reg[i])
+                    if self.reg[-1] is not None:
+                        outFullData[minY:maxY, minX:maxX] = \
+                            self._doPredict(windowInData, self.reg[-1])
+
+            # If there were no moving windows then do the downscaling on the whole input image
+            if np.all(np.isnan(outFullData)) and self.reg[-1] is not None:
+                outFullData = self._doPredict(inData, self.reg[-1])
+
+            # free the large input array
+            inData = None
+
+        else:
+            # Large image -> process by window directly from disk (no full in-memory array)
+            for i, extent in enumerate(self.windowExtents):
+                print(i)
+                if self.reg[i] is not None:
+                    [minX, minY] = utils.point2pix(extent[0], gt)  # UL
+                    [minX, minY] = [max(minX, 0), max(minY, 0)]
+                    [maxX, maxY] = utils.point2pix(extent[1], gt)  # LR
+                    [maxX, maxY] = [min(maxX, xsize), min(maxY, ysize)]
+                    w = maxX - minX
+                    h = maxY - minY
+
+                    # Read window per-band and assemble (float32)
+                    window_bands = []
+                    for band in range(bands):
+                        band_data = highResFile.GetRasterBand(band+1).ReadAsArray(minX, minY, w, h).astype(np.float32)
+                        no_data = highResFile.GetRasterBand(band+1).GetNoDataValue()
+                        if no_data is not None:
+                            band_data[band_data == no_data] = np.nan
+                        window_bands.append(band_data)
+                    windowInData = np.dstack(window_bands)
+
+                    # Record NaNs and replace with 0 for prediction
+                    window_nan = np.any(np.isnan(windowInData), axis=2)
+                    nanInd[minY:maxY, minX:maxX] = window_nan
+                    windowInData[np.isnan(windowInData)] = 0.0
+
+                    outWindowData[minY:maxY, minX:maxX] = \
+                        self._doPredict(windowInData, self.reg[i])
+                    if self.reg[-1] is not None:
+                        outFullData[minY:maxY, minX:maxX] = \
+                            self._doPredict(windowInData, self.reg[-1])
+
+            # If there were no moving windows then do the downscaling on the whole input image
+            if np.all(np.isnan(outFullData)) and self.reg[-1] is not None:
+                # Read full image in chunks to avoid large allocation; here we read band-by-band
+                full_bands = []
+                for band in range(bands):
+                    band_data = highResFile.GetRasterBand(band+1).ReadAsArray(0, 0, xsize, ysize).astype(np.float32)
+                    no_data = highResFile.GetRasterBand(band+1).GetNoDataValue()
+                    if no_data is not None:
+                        band_data[band_data == no_data] = np.nan
+                    full_bands.append(band_data)
+                fullInData = np.dstack(full_bands)
+                full_nan = np.any(np.isnan(fullInData), axis=2)
+                fullInData[np.isnan(fullInData)] = 0.0
+                outFullData = self._doPredict(fullInData, self.reg[-1])
+                nanInd = np.logical_or(nanInd, full_nan)
+                fullInData = None
 
         # Combine the windowed and whole image regressions
         # If there is no windowed regression just use the whole image regression
@@ -567,7 +636,6 @@ class DecisionTreeSharpener(object):
             outData = outWindowData
 
         # Fix NaN's
-        nanInd = np.any(nanInd, -1)
         outData[nanInd] = np.nan
 
         outImage = utils.saveImg(outData,
